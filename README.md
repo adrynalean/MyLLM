@@ -1,4 +1,4 @@
-# MyLLM — GPT Language Model Trained from Scratch
+# MyLLM — A Large Language Model Trained from Scratch
 
 A GPT-style language model built and trained from the ground up on OpenWebText — the same dataset used to train GPT-2.
 
