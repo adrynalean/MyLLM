@@ -1,0 +1,16 @@
+# Model checkpoints (too large for GitHub)
+*.pkl
+
+# CUDA build artifacts
+cuda/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Data files
+*.xz
+output_train.txt
+output_val.txt
