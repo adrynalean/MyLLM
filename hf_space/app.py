@@ -4,34 +4,33 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import math
 import pickle
 import torch
-from huggingface_hub import hf_hub_download
 import torch.nn as nn
 from torch.nn import functional as F
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from huggingface_hub import hf_hub_download
 import tiktoken
+import gradio as gr
 
-# ── Hyperparameters (must match the trained model) ──────────────────────────
+# ── Hyperparameters (must match trained model) ───────────────────────────────
 block_size = 256
 n_embd     = 512
 n_head     = 8
 n_layer    = 8
 dropout    = 0.1
-vocab_size = 50257   # GPT-2 BPE vocab
+vocab_size = 50257
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 
-# ── Model definition (identical to training code) ────────────────────────────
+# ── Model definition ─────────────────────────────────────────────────────────
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
         assert n_embd % n_head == 0
-        self.n_head  = n_head
+        self.n_head   = n_head
         self.head_dim = n_embd // n_head
-        self.c_attn  = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj  = nn.Linear(n_embd, n_embd, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.c_attn   = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.c_proj   = nn.Linear(n_embd, n_embd, bias=False)
+        self.drop     = nn.Dropout(dropout)
         self.register_buffer(
             "mask",
             torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
@@ -45,7 +44,7 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.dropout(self.c_proj(out))
+        return self.drop(self.c_proj(out))
 
 
 class FeedForward(nn.Module):
@@ -104,7 +103,7 @@ class GPTLanguageModel(nn.Module):
         for _ in range(max_new_tokens):
             index_cond = index[:, -block_size:]
             logits, _  = self.forward(index_cond)
-            logits = logits[:, -1, :] / temperature
+            logits     = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
@@ -114,100 +113,88 @@ class GPTLanguageModel(nn.Module):
         return index
 
 
-# ── Load model ───────────────────────────────────────────────────────────────
-MODEL_PATH = "../model-ow_best.pkl"
-
-# Custom unpickler — fixes class lookup when model was saved in a Kaggle __main__ context
+# ── Custom unpickler ─────────────────────────────────────────────────────────
 class ModelUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        class_map = {
+        mapping = {
             "GPTLanguageModel":    GPTLanguageModel,
             "CausalSelfAttention": CausalSelfAttention,
             "FeedForward":         FeedForward,
             "Block":               Block,
         }
-        if name in class_map:
-            return class_map[name]
+        if name in mapping:
+            return mapping[name]
         return super().find_class(module, name)
 
-# Auto-download from HuggingFace if not found locally
-if not os.path.exists(MODEL_PATH):
-    print("Model not found locally — downloading from HuggingFace Hub (~197MB)...")
-    MODEL_PATH = hf_hub_download(repo_id="Fluoron/MyLLM", filename="model-ow_best.pkl")
 
-print(f"Loading model from {MODEL_PATH} on {device}...")
-with open(MODEL_PATH, "rb") as f:
+# ── Load model from HuggingFace Hub ─────────────────────────────────────────
+print("Downloading model from HuggingFace Hub...")
+model_path = hf_hub_download(repo_id="Fluoron/MyLLM", filename="model-ow_best.pkl")
+print(f"Loading model on {device}...")
+with open(model_path, "rb") as f:
     model = ModelUnpickler(f).load()
 model.eval()
 model.to(device)
-print(f"Model loaded — {sum(p.numel() for p in model.parameters()):,} parameters")
+print(f"Ready — {sum(p.numel() for p in model.parameters()):,} parameters")
 
 # ── Tokenizer ────────────────────────────────────────────────────────────────
 enc    = tiktoken.get_encoding("gpt2")
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="MyLLM API", description="Text generation API using a GPT trained from scratch on OpenWebText")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-class GenerateRequest(BaseModel):
-    prompt:      str   = "The future of AI is"
-    max_tokens:  int   = 200
-    temperature: float = 0.8
-    top_k:       int   = 40
-
-
-class GenerateResponse(BaseModel):
-    prompt:    str
-    generated: str
-    full_text: str
-
-
-@app.get("/")
-def root():
-    return {
-        "model":      "MyLLM GPT",
-        "parameters": f"{sum(p.numel() for p in model.parameters()):,}",
-        "device":     device,
-        "status":     "ready",
-    }
-
-
-@app.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest):
-    if not req.prompt.strip():
-        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-    if req.max_tokens < 1 or req.max_tokens > 500:
-        raise HTTPException(status_code=400, detail="max_tokens must be between 1 and 500")
-
-    tokens  = encode(req.prompt)
+# ── Gradio inference function ────────────────────────────────────────────────
+def generate_text(prompt, max_tokens, temperature, top_k):
+    if not prompt.strip():
+        return "Please enter a prompt."
+    tokens  = encode(prompt)
     context = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+    output  = model.generate(context, max_new_tokens=int(max_tokens),
+                              temperature=temperature, top_k=int(top_k))
+    return decode(output[0].tolist())
 
-    output  = model.generate(
-        context,
-        max_new_tokens=req.max_tokens,
-        temperature=req.temperature,
-        top_k=req.top_k,
+
+# ── Gradio UI ────────────────────────────────────────────────────────────────
+with gr.Blocks(title="MyLLM — GPT Trained from Scratch") as demo:
+    gr.Markdown(
+        """
+        # MyLLM — GPT Language Model Trained from Scratch
+        A **51M parameter** decoder-only transformer trained on **50 million tokens** from
+        [OpenWebText](https://huggingface.co/datasets/Skylion007/openwebtext) — the same dataset used to train GPT-2.
+        Built entirely from scratch with PyTorch. No pretrained weights.
+        """
     )
 
-    full_text     = decode(output[0].tolist())
-    generated_new = decode(output[0].tolist()[len(tokens):])
+    with gr.Row():
+        with gr.Column(scale=2):
+            prompt_box = gr.Textbox(
+                label="Prompt",
+                placeholder="Type something to continue...",
+                lines=3,
+                value="The future of artificial intelligence is"
+            )
+            with gr.Row():
+                max_tokens  = gr.Slider(10, 400, value=200, step=10,  label="Max tokens")
+                temperature = gr.Slider(0.1, 1.5, value=0.8, step=0.05, label="Temperature")
+                top_k       = gr.Slider(1, 100,  value=40,  step=1,   label="Top-k")
+            generate_btn = gr.Button("Generate", variant="primary")
 
-    return GenerateResponse(
-        prompt=req.prompt,
-        generated=generated_new,
-        full_text=full_text,
+        with gr.Column(scale=3):
+            output_box = gr.Textbox(label="Generated text", lines=12, interactive=False)
+
+    generate_btn.click(
+        fn=generate_text,
+        inputs=[prompt_box, max_tokens, temperature, top_k],
+        outputs=output_box,
     )
 
+    gr.Markdown(
+        """
+        ---
+        **Temperature** — higher = more creative/random, lower = more focused
+        **Top-k** — limits sampling to the k most likely next tokens
+        **Source:** [GitHub](https://github.com/adrynalean/MyLLM)
+        """
+    )
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+demo.launch()
