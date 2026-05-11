@@ -1,3 +1,6 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import math
 import pickle
 import torch
@@ -111,11 +114,24 @@ class GPTLanguageModel(nn.Module):
 
 
 # ── Load model ───────────────────────────────────────────────────────────────
-MODEL_PATH = "../model-owt.pkl"   # adjust path if needed
+MODEL_PATH = "../model-ow_best.pkl"
+
+# Custom unpickler — fixes class lookup when model was saved in a Kaggle __main__ context
+class ModelUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        class_map = {
+            "GPTLanguageModel":    GPTLanguageModel,
+            "CausalSelfAttention": CausalSelfAttention,
+            "FeedForward":         FeedForward,
+            "Block":               Block,
+        }
+        if name in class_map:
+            return class_map[name]
+        return super().find_class(module, name)
 
 print(f"Loading model from {MODEL_PATH} on {device}...")
 with open(MODEL_PATH, "rb") as f:
-    model = pickle.load(f)
+    model = ModelUnpickler(f).load()
 model.eval()
 model.to(device)
 print(f"Model loaded — {sum(p.numel() for p in model.parameters()):,} parameters")
